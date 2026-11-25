@@ -1,0 +1,16 @@
+{
+  "name": "id-chip-reader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PWA that reads ICAO 9303 eMRTD chips (ePassports, Kenya Maisha card) over NFC via a thin native APDU bridge.",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "build:sim": "node tools/build-sim-data.mjs",
+    "build:artifact": "node tools/build-artifact.mjs",
+    "serve": "node tools/serve.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.1"
+  }
+}

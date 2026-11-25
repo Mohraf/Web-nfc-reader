@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Chip ID Reader</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="Read ICAO 9303 ePassport and national ID card chips (Kenya Maisha card, East African passports) over NFC.">
+<meta name="theme-color" content="#0b5d45">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="7" width="26" height="18" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><rect x="7" y="12" width="7" height="8" rx="1.5" fill="currentColor"/><path d="M18 13h7M18 16.5h7M18 20h4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <div>
+        <h1>Chip ID Reader</h1>
+        <p class="tagline">ICAO 9303 · ePassports &amp; national ID cards</p>
+      </div>
+    </div>
+    <div class="env" id="env" aria-live="polite"></div>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="panel controls" aria-labelledby="h-setup">
+    <h2 id="h-setup" class="section-title">Set up the read</h2>
+
+    <div class="field-group">
+      <span class="label" id="lbl-source">Reader</span>
+      <div class="segmented" role="radiogroup" aria-labelledby="lbl-source">
+        <button type="button" role="radio" id="src-native" data-source="native">Phone NFC</button>
+        <button type="button" role="radio" id="src-sim" data-source="sim">Simulator</button>
+      </div>
+      <p class="hint" id="source-hint"></p>
+    </div>
+
+    <div class="field-group">
+      <span class="label" id="lbl-doc">Document</span>
+      <div class="segmented" role="radiogroup" aria-labelledby="lbl-doc">
+        <button type="button" role="radio" id="doc-passport" data-doc="passport">Passport</button>
+        <button type="button" role="radio" id="doc-idcard" data-doc="idcard">ID card (Maisha)</button>
+      </div>
+    </div>
+
+    <figure class="doc-figure" id="doc-figure" aria-hidden="true"></figure>
+
+    <div class="field-group">
+      <span class="label" id="lbl-access">Unlock the chip with</span>
+      <div class="tabs" role="tablist" aria-labelledby="lbl-access">
+        <button type="button" role="tab" id="tab-mrz" data-access="MRZ" aria-controls="pane-mrz">MRZ details</button>
+        <button type="button" role="tab" id="tab-can" data-access="CAN" aria-controls="pane-can">Card access number</button>
+      </div>
+
+      <form id="pane-mrz" class="pane" role="tabpanel" aria-labelledby="tab-mrz" autocomplete="off">
+        <div class="grid-3">
+          <label class="input">
+            <span>Document number</span>
+            <input id="in-doc" inputmode="text" autocapitalize="characters" spellcheck="false" maxlength="14" placeholder="AK0012345">
+          </label>
+          <label class="input">
+            <span>Date of birth</span>
+            <input id="in-dob" inputmode="numeric" maxlength="6" placeholder="YYMMDD" pattern="\d{6}">
+          </label>
+          <label class="input">
+            <span>Date of expiry</span>
+            <input id="in-doe" inputmode="numeric" maxlength="6" placeholder="YYMMDD" pattern="\d{6}">
+          </label>
+        </div>
+        <div class="mrz-key" aria-live="polite">
+          <span class="mrz-key-label">Key the chip will check</span>
+          <code id="mrz-key" class="mrz-line"></code>
+        </div>
+        <details class="paste">
+          <summary>Paste the MRZ lines instead</summary>
+          <label class="input">
+            <span>Machine-readable zone (2 or 3 lines)</span>
+            <textarea id="in-mrz" rows="3" spellcheck="false" autocapitalize="characters" placeholder="IDKENMC00012340&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&#10;8507048M3407041KEN&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;5&#10;SPECIMEN&lt;&lt;BARAKA&lt;OTIENO&lt;&lt;&lt;&lt;&lt;&lt;&lt;"></textarea>
+          </label>
+          <p class="hint" id="mrz-parse-msg"></p>
+        </details>
+      </form>
+
+      <form id="pane-can" class="pane" role="tabpanel" aria-labelledby="tab-can" autocomplete="off" hidden>
+        <label class="input input-narrow">
+          <span>CAN (6 digits)</span>
+          <input id="in-can" inputmode="numeric" maxlength="6" placeholder="123456" pattern="\d{6}">
+        </label>
+        <p class="hint">The CAN is printed on the front of newer ID cards and some passport data pages. It only works when the chip supports PACE.</p>
+      </form>
+    </div>
+
+    <details class="options">
+      <summary>Read options</summary>
+      <label class="check"><input type="checkbox" id="opt-photo" checked> Read the facial image (DG2, slowest part)</label>
+      <label class="check"><input type="checkbox" id="opt-extra"> Read the signature image (DG7) if present</label>
+      <label class="check"><input type="checkbox" id="opt-log"> Show the APDU log while reading</label>
+    </details>
+
+    <button type="button" class="primary" id="btn-scan">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8.5a8 8 0 0 1 0 7M9.5 6a12 12 0 0 1 0 12M13 4a16 16 0 0 1 0 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      <span id="btn-scan-label">Read chip</span>
+    </button>
+    <p class="hint center" id="scan-hint">Keep your data on this device. Nothing you enter or read is uploaded.</p>
+  </section>
+
+  <section class="panel output" aria-labelledby="h-out">
+    <div class="output-head">
+      <h2 id="h-out" class="section-title">Chip data</h2>
+      <div class="actions" id="result-actions" hidden>
+        <button type="button" class="ghost" id="btn-copy">Copy JSON</button>
+        <button type="button" class="ghost" id="btn-download">Download JSON</button>
+        <button type="button" class="ghost" id="btn-clear">Clear</button>
+      </div>
+    </div>
+
+    <ol class="steps" id="steps" aria-label="Progress">
+      <li data-step="connect"><span class="dot"></span><span class="step-name">Detect chip</span></li>
+      <li data-step="access"><span class="dot"></span><span class="step-name">Unlock (PACE / BAC)</span></li>
+      <li data-step="read"><span class="dot"></span><span class="step-name">Read data groups</span></li>
+      <li data-step="verify"><span class="dot"></span><span class="step-name">Verify signature</span></li>
+    </ol>
+    <div class="status" id="status" role="status">
+      <div class="status-text" id="status-text">Ready.</div>
+      <div class="bar" id="bar" hidden><div class="bar-fill" id="bar-fill"></div></div>
+    </div>
+
+    <div id="result"></div>
+
+    <details class="log" id="log-wrap" hidden>
+      <summary>APDU log <span class="count" id="log-count"></span></summary>
+      <pre id="log" class="log-body"></pre>
+    </details>
+  </section>
+
+  <section class="panel wide" aria-labelledby="h-diag">
+    <h2 id="h-diag" class="section-title">Why a plain web page can't do this, and what does</h2>
+    <div class="explain">
+      <div class="explain-col">
+        <p>Passport and ID card chips are smart cards. To get anything out of one, the reader has to run a challenge–response handshake keyed from the MRZ or CAN (BAC or PACE), then send every command encrypted and signed (secure messaging). That needs raw <abbr title="Application Protocol Data Unit">APDU</abbr> access to the chip.</p>
+        <p><strong>Web NFC</strong> in Chrome only reads and writes NDEF messages, so it sees a passport as an empty tag. The <strong>WebToNative NFC add-on</strong> (<code>WTN.NFC.read</code>) also returns tag text only. Neither can send APDUs.</p>
+        <p>This app runs the whole ICAO 9303 protocol in JavaScript. The native part is a small Android shell that forwards APDUs to the chip and nothing else. The same web code runs unchanged in the browser simulator.</p>
+      </div>
+      <div class="explain-col">
+        <h3 class="mini-title">Test what this phone's browser can see</h3>
+        <div class="probe-row">
+          <button type="button" class="ghost" id="btn-webnfc">Scan with Web NFC</button>
+          <button type="button" class="ghost" id="btn-wtn">Scan with WebToNative</button>
+        </div>
+        <pre class="probe-out" id="probe-out">Tap a button, then hold a tag or document to the phone.</pre>
+        <h3 class="mini-title">Trusted issuer certificates (CSCA)</h3>
+        <p class="hint">Passive authentication checks the chip's signature with the document signer certificate it carries. Add your country's CSCA certificate (.cer, .der or .pem) to also verify who issued it. A demo CSCA for the simulator is built in.</p>
+        <div class="probe-row">
+          <label class="ghost file-btn"><input type="file" id="in-csca" accept=".cer,.crt,.der,.pem" multiple hidden>Add CSCA certificate</label>
+          <span class="hint" id="csca-count"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <p>Demo build. Reads only the open data groups (MRZ, photo, personal details). Fingerprints and iris (DG3/DG4) need terminal certificates from the issuing state and are never read.</p>
+</footer>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
