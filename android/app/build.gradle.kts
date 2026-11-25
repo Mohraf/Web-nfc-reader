@@ -48,9 +48,13 @@ abstract class CopyWebAssets : DefaultTask() {
 
     @TaskAction
     fun copy() {
+        // Read properties first: inside the copy spec, `includes` would resolve to CopySpec.includes.
+        val patterns = includes.get()
+        val source = webRoot.get().asFile
+        val target = outputDir.dir("www").get().asFile
         fs.sync {
-            from(webRoot) { include(includes.get()) }
-            into(outputDir.dir("www"))
+            from(source) { include(patterns) }
+            into(target)
         }
     }
 }
