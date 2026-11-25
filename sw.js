@@ -1,5 +1,5 @@
 // Offline cache for the app shell. Network-first for HTML so updates show up; cache-first for the rest.
-const VERSION = 'cir-v1';
+const VERSION = 'cir-v2';
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png',
   'js/app.js', 'js/util/bytes.js', 'js/util/tlv.js',

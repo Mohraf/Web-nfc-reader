@@ -1,4 +1,5 @@
-// UI controller. All protocol work lives in js/icao; transports in js/transports.
+// UI controller: a step-by-step flow (document → access key → prepare → position → scan → result).
+// All protocol work lives in js/icao; transports in js/transports.
 import { readDocument } from './icao/reader.js';
 import { checkDigit, normDocNumber, parseMRZ, mrzDateToISO } from './icao/mrz.js';
 import { parseCertificateBytes } from './icao/passive-auth.js';
@@ -17,48 +18,65 @@ const store = {
 };
 
 const state = {
-  source: 'sim',
-  doc: store.get('doc', 'passport'),
-  access: 'MRZ',
-  nativeStatus: 'absent',
-  busy: false,
-  lastResult: null,
-  isSample: false,
-  logLines: [],
+  source: 'sim', doc: store.get('doc', 'passport'), access: 'MRZ', nativeStatus: 'absent',
+  busy: false, cancelled: false, transport: null, lastResult: null, logLines: [], stack: ['doc'], progress: 0,
 };
 
-const COUNTRIES = { KEN: 'Kenya', UGA: 'Uganda', TZA: 'Tanzania', RWA: 'Rwanda', BDI: 'Burundi', SSD: 'South Sudan', COD: 'DR Congo', SOM: 'Somalia', ETH: 'Ethiopia', D: 'Germany', GBR: 'United Kingdom', USA: 'United States', UTO: 'Utopia (ICAO specimen)' };
-const country = (c) => (c ? `${COUNTRIES[c] || c}${COUNTRIES[c] ? ` (${c})` : ''}` : '—');
+const COUNTRIES = { KEN: 'Kenya', UGA: 'Uganda', TZA: 'Tanzania', RWA: 'Rwanda', BDI: 'Burundi', SSD: 'South Sudan', COD: 'DR Congo', SOM: 'Somalia', ETH: 'Ethiopia', UTO: 'Utopia (specimen)' };
+const country = (c) => (c ? (COUNTRIES[c] ? `${COUNTRIES[c]} (${c})` : c) : '—');
 const SEX = { M: 'Male', F: 'Female', '<': 'Unspecified', X: 'Unspecified' };
 const fmtDate = (iso) => {
   const m = /^(\d{4})-?(\d{2})-?(\d{2})$/.exec(iso || '');
   if (!m) return iso || '—';
-  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
-  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' });
+  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' });
 };
+
+// ---------------------------------------------------------------- navigation
+const LABELS = {
+  doc: 'Step 1 of 3 · Document', key: 'Step 2 of 3 · Details', prep: 'Step 3 of 3 · Chip', position: 'Step 3 of 3 · Chip',
+  scan: 'Step 3 of 3 · Chip', result: 'Result', about: 'How it works',
+};
+function show(name) {
+  for (const s of document.querySelectorAll('.screen')) {
+    const on = s.dataset.screen === name;
+    s.hidden = !on;
+    s.classList.toggle('enter', on);
+  }
+  $('step-label').textContent = LABELS[name];
+  $('btn-back').setAttribute('aria-hidden', String(state.stack.length <= 1));
+  $('btn-about').setAttribute('aria-hidden', String(name === 'about'));
+  window.scrollTo({ top: 0 });
+}
+function go(name) { if (state.stack.at(-1) !== name) state.stack.push(name); show(name); }
+function back() {
+  if (state.stack.at(-1) === 'scan') cancelScan();
+  if (state.stack.length > 1) state.stack.pop();
+  show(state.stack.at(-1));
+}
+function reset(name = 'doc') { state.stack = [name]; show(name); }
 
 // ---------------------------------------------------------------- environment
 async function detectEnvironment() {
   state.nativeStatus = AndroidBridgeTransport.present() ? await AndroidBridgeTransport.status() : 'absent';
   const chips = [];
   if (state.nativeStatus === 'ready') chips.push(['ok', 'Phone NFC ready']);
-  else if (state.nativeStatus === 'disabled') chips.push(['warn', 'NFC is off']);
+  else if (state.nativeStatus === 'disabled') chips.push(['warn', 'NFC is turned off']);
   else if (state.nativeStatus === 'unsupported') chips.push(['bad', 'No NFC on this phone']);
-  else chips.push(['', 'No APDU bridge']);
-  chips.push(webNfcSupported() ? ['ok', 'Web NFC (NDEF only)'] : ['', 'No Web NFC']);
-  if (webToNativeAvailable()) chips.push(['ok', 'WebToNative (NDEF only)']);
+  else chips.push(['', 'Browser only: no chip access']);
+  if (webNfcSupported()) chips.push(['', 'Web NFC (tags only)']);
+  if (webToNativeAvailable()) chips.push(['', 'WebToNative (tags only)']);
   $('env').innerHTML = chips.map(([c, t]) => `<span class="chip ${c}">${esc(t)}</span>`).join('');
   $('btn-webnfc').disabled = !webNfcSupported();
   $('btn-wtn').disabled = !webToNativeAvailable();
 }
 
 function sourceHint() {
-  if (state.source === 'sim') return 'Runs the real protocol against a virtual chip holding fictional specimen data. Use it to try the app anywhere.';
+  if (state.source === 'sim') return 'Runs the real protocol against a virtual chip with fictional specimen data. No document needed.';
   switch (state.nativeStatus) {
-    case 'ready': return 'Hold the document flat against the back of the phone. Passports: open the cover with the chip page (often the back cover). Keep it still until the read finishes.';
-    case 'disabled': return 'NFC is turned off. Turn it on in Android settings, then come back.';
-    case 'unsupported': return 'This phone has no NFC hardware.';
-    default: return 'Reading a real chip needs the Android app shell, because browsers cannot send APDUs to a chip. Use the simulator here, or install the shell from the /android folder of this project.';
+    case 'ready': return 'Uses this phone’s NFC reader.';
+    case 'disabled': return 'Turn on NFC in Android settings, then come back.';
+    case 'unsupported': return 'This phone has no NFC hardware. Use the simulator.';
+    default: return 'Browsers can’t talk to ID chips. Install the Chip ID Reader Android app to read a real document, or use the simulator.';
   }
 }
 
@@ -68,15 +86,17 @@ function setSource(src) {
   for (const b of document.querySelectorAll('[data-source]')) b.setAttribute('aria-checked', String(b.dataset.source === src));
   $('source-hint').textContent = sourceHint();
   if (src === 'sim') fillSpecimen();
-  updateScanButton();
+  else { for (const id of ['in-doc', 'in-dob', 'in-doe', 'in-can', 'in-mrz']) $(id).value = ''; renderKey(); }
+  updatePosition();
 }
 
 function setDoc(doc) {
   state.doc = doc;
   store.set('doc', doc);
   for (const b of document.querySelectorAll('[data-doc]')) b.setAttribute('aria-checked', String(b.dataset.doc === doc));
-  $('doc-figure').innerHTML = doc === 'passport' ? PASSPORT_FIG : IDCARD_FIG;
+  $('doc-figure').innerHTML = doc === 'passport' ? PASSPORT_TIP : IDCARD_TIP;
   if (state.source === 'sim') fillSpecimen();
+  updatePosition();
 }
 
 function setAccess(mode) {
@@ -84,6 +104,18 @@ function setAccess(mode) {
   for (const b of document.querySelectorAll('[data-access]')) b.setAttribute('aria-selected', String(b.dataset.access === mode));
   $('pane-mrz').hidden = mode !== 'MRZ';
   $('pane-can').hidden = mode !== 'CAN';
+  $('key-error').hidden = true;
+}
+
+function updatePosition() {
+  const sim = state.source === 'sim';
+  $('pos-lead').textContent = sim
+    ? 'In simulator mode there’s nothing to hold. Tap Continue to run the scan against the virtual chip.'
+    : state.doc === 'passport'
+      ? 'Close the passport and hold the top back of your phone flat against the cover with the chip symbol for 5–10 seconds.'
+      : 'Hold the top back of your phone flat against the card for 5–10 seconds.';
+  $('btn-scan-label').textContent = sim ? 'Run simulated scan' : 'Continue';
+  $('btn-scan').disabled = !sim && state.nativeStatus !== 'ready';
 }
 
 function fillSpecimen() {
@@ -98,13 +130,13 @@ function fillSpecimen() {
 }
 
 function renderKey() {
-  const doc = normDocNumber($('in-doc').value).padEnd(9, '<');
+  const raw = normDocNumber($('in-doc').value);
+  const doc = raw.padEnd(9, '<');
   const dob = $('in-dob').value.replace(/\D/g, '');
   const doe = $('in-doe').value.replace(/\D/g, '');
   const part = (v, n) => (v.length === n ? `${esc(v)}<span class="cd">${checkDigit(v)}</span>` : `<span class="empty">${esc(v.padEnd(n, '·'))}·</span>`);
-  const docOk = normDocNumber($('in-doc').value).length > 0;
-  $('mrz-key').innerHTML = (docOk ? `${esc(doc)}<span class="cd">${checkDigit(doc)}</span>` : '<span class="empty">·········· </span>') + part(dob, 6) + part(doe, 6);
-  for (const [id, ok] of [['in-dob', !dob || /^\d{6}$/.test(dob)], ['in-doe', !doe || /^\d{6}$/.test(doe)]]) $(id).setAttribute('aria-invalid', String(!ok));
+  $('mrz-key').innerHTML = (raw ? `${esc(doc)}<span class="cd">${checkDigit(doc)}</span>` : '<span class="empty">··········</span>') + part(dob, 6) + part(doe, 6);
+  for (const [id, v] of [['in-dob', dob], ['in-doe', doe]]) $(id).setAttribute('aria-invalid', String(!!v && !/^\d{6}$/.test(v)));
 }
 
 function onMrzPaste() {
@@ -113,28 +145,28 @@ function onMrzPaste() {
   if (!text) { msg.textContent = ''; return; }
   try {
     const m = parseMRZ(text);
-    $('in-doc').value = m.documentNumber;
-    $('in-dob').value = m.dateOfBirth;
-    $('in-doe').value = m.dateOfExpiry;
+    $('in-doc').value = m.documentNumber; $('in-dob').value = m.dateOfBirth; $('in-doe').value = m.dateOfExpiry;
     renderKey();
     const bad = Object.entries(m.checks).filter(([, v]) => !v).map(([k]) => k);
-    msg.textContent = `${m.format} ${m.format === 'TD1' ? 'ID card' : 'document'} recognised${bad.length ? `. Check digit mismatch in: ${bad.join(', ')}. Correct any misread characters.` : ', all check digits valid.'}`;
+    msg.textContent = bad.length ? `Check digit mismatch in: ${bad.join(', ')}. Fix any misread characters.` : `${m.format === 'TD1' ? 'ID card' : 'Passport'} MRZ recognised. All check digits are valid.`;
     if (m.format === 'TD1') setDoc('idcard');
     if (m.format === 'TD3') setDoc('passport');
-  } catch (e) {
-    msg.textContent = e.message;
-  }
+  } catch (e) { msg.textContent = e.message; }
 }
 
-function updateScanButton() {
-  const btn = $('btn-scan');
-  const disabled = state.busy || (state.source === 'native' && state.nativeStatus !== 'ready');
-  btn.disabled = disabled;
-  btn.classList.toggle('busy', state.busy);
-  $('btn-scan-label').textContent = state.busy ? 'Reading…' : state.source === 'sim' ? 'Read simulated chip' : 'Read chip';
+function validateKey() {
+  const err = $('key-error');
+  let m = '';
+  if (state.access === 'MRZ') {
+    if (!normDocNumber($('in-doc').value)) m = 'Enter the document number from the MRZ.';
+    else if (!/^\d{6}$/.test($('in-dob').value.trim())) m = 'Enter the date of birth as YYMMDD, for example 900115.';
+    else if (!/^\d{6}$/.test($('in-doe').value.trim())) m = 'Enter the expiry date as YYMMDD, for example 320301.';
+  } else if (!/^\d{6}$/.test($('in-can').value.trim())) m = 'The CAN is 6 digits.';
+  err.textContent = m; err.hidden = !m;
+  return !m;
 }
 
-// ---------------------------------------------------------------- progress + log
+// ---------------------------------------------------------------- scan progress
 const PHASES = ['connect', 'access', 'read', 'verify'];
 function phaseOf(t) {
   if (/^Waiting/.test(t)) return 'connect';
@@ -144,6 +176,38 @@ function phaseOf(t) {
   if (t === 'Done') return 'done';
   return null;
 }
+function friendly(t, f) {
+  const pct = f !== undefined ? ` · ${Math.round(f * 100)}%` : '';
+  if (/^Waiting/.test(t)) return 'Searching for chip…';
+  if (/^Reading chip cap/.test(t)) return 'Chip found · checking security';
+  if (/^(Authenticat|PACE|Chip offers)/.test(t)) return 'Unlocking the chip…';
+  if (/DG2/.test(t)) return 'Reading photo' + pct;
+  if (/DG1\b/.test(t)) return 'Reading MRZ data';
+  if (/DG11|DG12/.test(t)) return 'Reading personal details';
+  if (/DG7/.test(t)) return 'Reading signature image';
+  if (/SOD/.test(t)) return 'Reading the chip’s signature';
+  if (/^Reading/.test(t)) return 'Reading chip data';
+  if (/^Verifying/.test(t)) return 'Checking authenticity…';
+  return t;
+}
+const BASE = { connect: 0, access: 8, read: 30, verify: 94, done: 100 };
+let filesStarted = 0, lastFile = '';
+function onStatus(text, fraction) {
+  const p = phaseOf(text);
+  if (p) {
+    setPhase(p);
+    if (p !== 'connect') { $('hero').dataset.state = 'reading'; $('hero-title').textContent = 'Reading your chip'; $('scan-lead').textContent = 'Keep the phone still until the scan finishes.'; }
+  }
+  if (p === 'read') {
+    const label = text.replace(/\s.*/, '') + text.split(' ')[1];
+    if (label !== lastFile) { lastFile = label; filesStarted++; }
+    state.progress = Math.max(state.progress, 30 + 64 * Math.min(1, (filesStarted - 1 + (fraction ?? 0)) / 6));
+  } else if (p) {
+    state.progress = Math.max(state.progress, BASE[p]);
+  }
+  $('ring-fill').style.strokeDasharray = `${state.progress} 100`;
+  $('status-text').textContent = friendly(text, fraction);
+}
 function setPhase(p, failed = false) {
   const idx = p === 'done' ? PHASES.length : PHASES.indexOf(p);
   for (const li of $('steps').children) {
@@ -151,45 +215,39 @@ function setPhase(p, failed = false) {
     li.className = i < idx ? 'done' : i === idx ? (failed ? 'failed' : 'active') : '';
   }
 }
-let currentPhase = null;
-function onStatus(text, fraction) {
-  const p = phaseOf(text);
-  if (p) { currentPhase = p; setPhase(p); }
-  $('status').classList.remove('error');
-  $('status-text').textContent = text;
-  $('bar').hidden = fraction === undefined;
-  if (fraction !== undefined) $('bar-fill').style.width = `${Math.round(fraction * 100)}%`;
+function resetScanView() {
+  state.progress = 0; filesStarted = 0; lastFile = '';
+  $('hero').dataset.state = 'searching';
+  $('hero-title').textContent = 'Ready to scan';
+  $('scan-lead').textContent = state.source === 'sim' ? 'Connecting to the virtual chip…' : 'Slowly move your phone across the document until the chip is found.';
+  $('status-pill').className = 'pill';
+  $('status-text').textContent = 'Searching for chip…';
+  $('ring-fill').style.strokeDasharray = '0 100';
+  $('error-actions').hidden = true;
+  $('btn-cancel').hidden = false;
+  for (const li of $('steps').children) li.className = '';
 }
 
 function logApdu(e) {
-  const tag = e.dir === 'C' ? '>' : '<';
   const plain = hex(e.bytes).replace(/(..)/g, '$1 ').trim();
   const short = plain.length > 120 ? plain.slice(0, 120) + ` … (${e.bytes.length} bytes)` : plain;
-  state.logLines.push(`<span class="${e.dir === 'C' ? 'c' : ''}">${tag} ${esc(short)}</span>` + (e.wire ? `\n<span class="w">  wire ${e.wire.length} bytes, secure messaging</span>` : ''));
+  state.logLines.push(`<span class="${e.dir === 'C' ? 'c' : ''}">${e.dir === 'C' ? '>' : '<'} ${esc(short)}</span>` + (e.wire ? `\n<span class="w">  wire ${e.wire.length} bytes, secure messaging</span>` : ''));
   if (state.logLines.length > 600) state.logLines.splice(0, state.logLines.length - 600);
-  if (!$('log-wrap').hidden) { $('log').innerHTML = state.logLines.join('\n'); $('log').scrollTop = 1e9; }
-  $('log-count').textContent = `(${state.logLines.length})`;
 }
 
 // ---------------------------------------------------------------- trust anchors
 function trustAnchors() {
-  const list = [b64decode(DEMO_CSCA_B64), ...store.get('csca', []).map(b64decode)];
   const out = [];
-  for (const der of list) { try { out.push(parseCertificateBytes(der)); } catch { /* skip unreadable */ } }
+  for (const der of [b64decode(DEMO_CSCA_B64), ...store.get('csca', []).map(b64decode)]) { try { out.push(parseCertificateBytes(der)); } catch { /* skip */ } }
   return out;
 }
-function renderCscaCount() {
-  const n = store.get('csca', []).length;
-  $('csca-count').textContent = n ? `${n} added on this device` : 'None added yet';
-}
+function renderCscaCount() { const n = store.get('csca', []).length; $('csca-count').textContent = n ? `${n} added on this device` : 'None added yet'; }
 async function importCsca(files) {
   const added = store.get('csca', []);
   for (const f of files) {
-    let bytes = new Uint8Array(await f.arrayBuffer());
-    const text = new TextDecoder().decode(bytes);
-    const pem = text.match(/-----BEGIN CERTIFICATE-----([\s\S]+?)-----END CERTIFICATE-----/g);
-    const ders = pem ? pem.map((p) => b64decode(p.replace(/-----[^-]+-----|\s/g, ''))) : [bytes];
-    for (const der of ders) {
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    const pem = new TextDecoder().decode(bytes).match(/-----BEGIN CERTIFICATE-----([\s\S]+?)-----END CERTIFICATE-----/g);
+    for (const der of pem ? pem.map((p) => b64decode(p.replace(/-----[^-]+-----|\s/g, ''))) : [bytes]) {
       try { parseCertificateBytes(der); added.push(btoa(String.fromCharCode(...der))); } catch { /* not a certificate */ }
     }
   }
@@ -198,176 +256,171 @@ async function importCsca(files) {
 }
 
 // ---------------------------------------------------------------- scan
-async function scan({ sample = false } = {}) {
+async function scan() {
   if (state.busy) return;
   const access = state.access === 'MRZ'
     ? { type: 'MRZ', documentNumber: $('in-doc').value, dateOfBirth: $('in-dob').value.trim(), dateOfExpiry: $('in-doe').value.trim() }
     : { type: 'CAN', can: $('in-can').value.trim() };
-
-  let transport;
-  if (state.source === 'sim') {
-    const d = SIM_DOCS.find((x) => x.id === state.doc);
-    transport = new SimulatorTransport(d, sample ? { tapDelay: 0, latency: 0 } : {});
-  } else {
-    transport = new AndroidBridgeTransport();
-  }
-
-  state.busy = true; state.logLines = []; currentPhase = 'connect';
-  updateScanButton();
-  $('log').innerHTML = '';
-  $('log-wrap').hidden = !$('opt-log').checked;
-  if (!sample) { $('result').innerHTML = ''; $('result-actions').hidden = true; }
+  const transport = state.source === 'sim' ? new SimulatorTransport(SIM_DOCS.find((x) => x.id === state.doc)) : new AndroidBridgeTransport();
+  Object.assign(state, { busy: true, cancelled: false, transport, logLines: [] });
+  go('scan');
+  resetScanView();
   setPhase('connect');
   try {
     const result = await readDocument(transport, {
       access, readPhoto: $('opt-photo').checked, readExtra: $('opt-extra').checked,
       trustAnchors: trustAnchors(), onStatus, onApdu: logApdu,
     });
-    state.lastResult = result; state.isSample = sample;
+    if (state.cancelled) return;
+    state.lastResult = result;
     setPhase('done');
-    onStatus(sample
-      ? 'Sample read from the simulator. Choose a reader and press Read to run it yourself.'
-      : `Done in ${(result.timings.total / 1000).toFixed(1)} s.`);
+    $('ring-fill').style.strokeDasharray = '100 100';
+    navigator.vibrate?.(60);
     renderResult(result, transport);
-    if (!sample) navigator.vibrate?.(60);
+    state.stack = ['doc', 'result'];
+    show('result');
   } catch (e) {
-    setPhase(currentPhase || 'connect', true);
-    $('status').classList.add('error');
-    $('status-text').textContent = friendlyError(e);
-    $('bar').hidden = true;
+    if (state.cancelled) return;
+    const phase = [...$('steps').children].find((li) => li.className === 'active')?.dataset.step || 'connect';
+    setPhase(phase, true);
+    $('hero').dataset.state = 'error';
+    $('hero-title').textContent = 'Scan didn’t finish';
+    $('scan-lead').textContent = friendlyError(e);
+    $('status-pill').className = 'pill error';
+    $('status-text').textContent = /Authentication failed/.test(e.message) ? 'Chip refused the details' : 'Connection interrupted';
+    $('error-actions').hidden = false;
+    $('btn-cancel').hidden = true;
     try { await transport.disconnect?.(); } catch { /* ignore */ }
   } finally {
     state.busy = false;
-    updateScanButton();
-    if (!$('log-wrap').hidden || state.logLines.length) { $('log').innerHTML = state.logLines.join('\n'); }
   }
+}
+
+function cancelScan() {
+  if (!state.busy) return;
+  state.cancelled = true;
+  state.busy = false;
+  state.transport?.disconnect?.().catch(() => {});
 }
 
 function friendlyError(e) {
   const m = e?.message || String(e);
-  if (/Authentication failed/.test(m)) return `${m}. The chip refused the key. Re-check the document number and both dates against the MRZ (O vs 0, I vs 1), or use the CAN.`;
-  if (/lost|Tag was lost|TagLost/i.test(m)) return 'Connection to the chip was lost. Keep the document still against the phone for the whole read and try again.';
+  if (/Authentication failed/.test(m)) return 'The details don’t match the chip. Check the document number and both dates against the MRZ (O and 0, I and 1 are easy to mix up), or use the CAN.';
+  if (/lost|TagLost|not connected/i.test(m)) return 'The connection to the chip was lost. Keep the phone flat and still against the document for the whole scan.';
+  if (/No document detected/.test(m)) return 'No chip was found. Move the phone slowly over the document, starting near the camera.';
   return m;
 }
 
-// ---------------------------------------------------------------- rendering
+// ---------------------------------------------------------------- result
+const ICON = {
+  ok: '<svg viewBox="0 0 24 24"><path d="M6 12.5l4 4 8-9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  warn: '<svg viewBox="0 0 24 24"><path d="M12 8v5M12 16.5v.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>',
+  bad: '<svg viewBox="0 0 24 24"><path d="M8 8l8 8M16 8l-8 8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>',
+  lock: '<svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>',
+};
+
 function renderResult(r, transport) {
-  const dg1 = r.dataGroups.DG1 || {};
-  const dg11 = r.dataGroups.DG11 || {};
-  const dg12 = r.dataGroups.DG12 || {};
+  const dg1 = r.dataGroups.DG1 || {}, dg11 = r.dataGroups.DG11 || {}, dg12 = r.dataGroups.DG12 || {};
   const img = r.dataGroups.DG2?.[0];
   const pa = r.passiveAuth || {};
+  const a = r.access || {};
   const isCard = dg1.format === 'TD1';
-  const kind = isCard ? 'National ID card' : dg1.documentCode?.startsWith('P') ? 'Passport' : 'Travel document';
+  const sim = state.source === 'sim';
 
   let photo = '<div class="portrait">No photo read</div>';
-  if (img) {
-    if (img.mime === 'image/jpeg') {
-      const url = URL.createObjectURL(new Blob([img.data], { type: img.mime }));
-      photo = `<img class="portrait" src="${url}" alt="Facial image from the chip (DG2)">`;
-    } else {
-      photo = `<div class="portrait">JPEG 2000 photo (${Math.round(img.data.length / 1024)} KB). This browser can't display it; it is included in the JSON export.</div>`;
-    }
-  }
+  if (img?.mime === 'image/jpeg') photo = `<img class="portrait" src="${URL.createObjectURL(new Blob([img.data], { type: img.mime }))}" alt="Photo from the chip">`;
+  else if (img) photo = `<div class="portrait">JPEG 2000 photo, in JSON export</div>`;
 
+  const checks = [];
+  checks.push(['ok', 'lock', 'Chip unlocked securely', `${a.protocol}${a.mapping ? ' ' + a.mapping : ''} · ${a.cipher}${a.keyBits ? '-' + a.keyBits : ''}${a.curve ? ' · ' + a.curve : ''}`]);
+  if (pa.hashesOk) checks.push(['ok', 'ok', 'Data hasn’t been altered', `All ${pa.dataGroups.length} data groups match the chip’s signed hashes`]);
+  else if (pa.dataGroups?.length) checks.push(['bad', 'bad', 'Data doesn’t match', pa.dataGroups.filter((d) => !d.ok).map((d) => 'DG' + d.dg).join(', ') + ' failed the hash check']);
+  else checks.push(['warn', 'warn', 'Integrity not checked', 'The chip’s security object could not be read']);
+  if (pa.signature === true) checks.push(['ok', 'ok', 'Signed by the document signer', pa.signer?.subject || '']);
+  else if (pa.signature === false) checks.push(['bad', 'bad', 'Signature invalid', (pa.errors || []).join('; ')]);
+  if (pa.csca?.valid) checks.push(['ok', 'ok', 'Issuer is trusted', pa.csca.subject]);
+  else if (pa.csca) checks.push(['bad', 'bad', 'Issuer check failed', pa.csca.subject]);
+  else checks.push(['warn', 'warn', 'Issuer not verified', 'Add the issuing country’s CSCA certificate under How it works']);
+  if (!dg1.valid) checks.push(['warn', 'warn', 'MRZ check digit mismatch', 'The chip’s MRZ data has an inconsistent check digit']);
+
+  const allGood = pa.hashesOk && pa.signature === true;
   const personal = dg11.personalNumber || dg1.personalNumber || dg1.optionalData1 || '';
-  const facts = [
-    ['Document no.', dg1.documentNumber],
+  const details = [
     ['Nationality', country(dg1.nationality)],
-    ['Date of birth', fmtDate(dg11.fullDateOfBirth || mrzDateToISO(dg1.dateOfBirth, 'birth'))],
-    ['Sex', SEX[dg1.sex] || dg1.sex],
-    ['Date of expiry', fmtDate(mrzDateToISO(dg1.dateOfExpiry, 'expiry'))],
     ['Issuing state', country(dg1.issuingState)],
-    ...(personal ? [['Personal no.', personal]] : []),
+    ...(personal ? [['Personal number', personal]] : []),
     ...(dg11.placeOfBirth ? [['Place of birth', dg11.placeOfBirth]] : []),
     ...(dg12.dateOfIssue ? [['Date of issue', fmtDate(dg12.dateOfIssue)]] : []),
     ...(dg12.issuingAuthority ? [['Issued by', dg12.issuingAuthority]] : []),
   ];
-
-  const verdicts = [];
-  const a = r.access || {};
-  verdicts.push(['ok plain', `${a.protocol}${a.mapping ? ' ' + a.mapping : ''} · ${a.cipher}${a.keyBits ? '-' + a.keyBits : ''}${a.curve ? ' · ' + a.curve : ''}`]);
-  if (pa.hashesOk) verdicts.push(['ok', 'Data matches chip signature']);
-  else if (pa.dataGroups?.length) verdicts.push(['bad', 'Data hash mismatch']);
-  else verdicts.push(['warn', 'Integrity not checked']);
-  if (pa.signature === true) verdicts.push(['ok', 'Document signer signature valid']);
-  else if (pa.signature === false) verdicts.push(['bad', 'Signer signature invalid']);
-  if (pa.csca?.valid) verdicts.push(['ok', 'Issuer certificate trusted']);
-  else if (pa.csca && !pa.csca.valid) verdicts.push(['bad', 'Issuer certificate check failed']);
-  else verdicts.push(['warn', 'Issuer not verified (no CSCA loaded)']);
-  if (!dg1.valid) verdicts.push(['warn', 'MRZ check digit mismatch']);
-
-  const sec = [
-    ['Access control', `${a.protocol} using ${a.password === 'CAN' ? 'the CAN' : 'the MRZ'}${r.chip.paceOptions?.length && a.protocol === 'BAC' ? ' (chip also lists PACE options this demo does not support)' : ''}`],
-    ['Chip offers', r.chip.paceOptions?.length ? r.chip.paceOptions.map((p) => `PACE ${p.mapping} ${p.cipher}-${p.keyBits}${p.curve ? ' ' + p.curve : ''}`).join('; ') : 'BAC only'],
-    ['Data groups on chip', (r.chip.dataGroupsPresent || []).map((n) => `DG${n}`).join(', ') + (r.chip.ldsVersion ? ` · LDS ${r.chip.ldsVersion.replace(/^(\d\d)(\d\d)$/, (m, x, y) => `${+x}.${+y}`)}` : '')],
-    ['Hash check', pa.dataGroups?.length ? `<span class="dg-hashes">${pa.dataGroups.map((d) => `<span class="chip ${d.ok ? 'ok' : 'bad'}" title="${esc(DG_NAMES[d.dg] || '')}">DG${d.dg}</span>`).join('')}</span> ${esc(pa.hashAlgorithm || '')}` : '—'],
-    ['Document signer', pa.signer ? esc(`${pa.signer.subject} · ${pa.signer.key} · valid ${pa.signer.notBefore} to ${pa.signer.notAfter}`) : '—'],
-    ['Issuer (CSCA)', pa.csca ? esc(pa.csca.subject) : esc(pa.signer?.issuer || '—') + ' · not verified'],
+  const tech = [
+    ['Read with', esc(sim ? 'Simulator (fictional specimen)' : transport.name)],
+    ['Chip offers', esc(r.chip.paceOptions?.length ? r.chip.paceOptions.map((p) => `PACE ${p.mapping} ${p.cipher}-${p.keyBits}${p.curve ? ' ' + p.curve : ''}`).join('; ') : 'BAC only')],
+    ['Data groups', esc((r.chip.dataGroupsPresent || []).map((n) => `DG${n}`).join(', '))],
+    ['Hash check', pa.dataGroups?.length ? `<span class="dg-chips">${pa.dataGroups.map((d) => `<span class="chip ${d.ok ? 'ok' : 'bad'}" title="${esc(DG_NAMES[d.dg] || '')}">DG${d.dg}</span>`).join('')}</span>` : '—'],
+    ['Document signer', esc(pa.signer ? `${pa.signer.key}, valid ${pa.signer.notBefore} to ${pa.signer.notAfter}` : '—')],
+    ...(r.dataGroups.DG14 ? [['DG14 protocols', esc([...new Set(r.dataGroups.DG14.map((x) => x.kind))].join(', ') + ' (not run)')]] : []),
+    ...(r.dataGroups.DG15 ? [['Active Authentication', 'Key present (not run)']] : []),
+    ...Object.entries(r.dataGroups).filter(([k]) => k.endsWith('Error')).map(([k, v]) => [k.replace('Error', ''), esc(v)]),
+    ['Time', `${(r.timings.auth / 1000).toFixed(1)} s to unlock · ${(r.timings.total / 1000).toFixed(1)} s total`],
   ];
-  if (r.dataGroups.DG14) sec.push(['Advanced protocols (DG14)', esc([...new Set(r.dataGroups.DG14.map((x) => x.kind))].join(', ')) + ' · not run in this demo']);
-  if (r.dataGroups.DG15) sec.push(['Active Authentication (DG15)', 'Key present · not run in this demo']);
-  for (const e of pa.errors || []) sec.push(['Note', esc(e)]);
-  const errs = Object.entries(r.dataGroups).filter(([k]) => k.endsWith('Error'));
-  for (const [k, v] of errs) sec.push([k.replace('Error', ''), esc(v)]);
-  sec.push(['Timing', `${(r.timings.auth / 1000).toFixed(1)} s to unlock · ${(r.timings.total / 1000).toFixed(1)} s total · ${state.logLines.length / 2 | 0} commands`]);
-
-  const sig = r.dataGroups.DG7;
-  const sigHtml = sig && sig.mime === 'image/jpeg' ? `<p class="extra-title">Signature (DG7)</p><img src="${URL.createObjectURL(new Blob([sig.data], { type: sig.mime }))}" alt="Holder signature" style="max-height:70px;max-width:100%">` : '';
 
   $('result').innerHTML = `
-    <article class="card-doc">
-      <div class="card-doc-head"><span class="kind">${esc(kind)} · ${esc(dg1.format || '')}</span>${state.source === 'sim' ? '<span class="sample">Simulator · fictional specimen</span>' : `<span class="sample">${esc(transport.name)}</span>`}</div>
-      <div class="card-doc-body">
+    <span class="icon-tile lg ${allGood ? 'ok' : ''}" aria-hidden="true">${allGood ? ICON.ok : ICON.warn}</span>
+    <h1 class="title" id="t-result">${allGood ? 'Chip read and verified' : 'Chip read, with warnings'}</h1>
+    <p class="lead">${allGood ? 'The details below come straight from the chip and match its digital signature.' : 'Some checks didn’t pass. See the security checks below.'}</p>
+    <article class="id-card">
+      <div class="id-card-top">
+        <span class="id-card-kind">${esc(country(dg1.issuingState).replace(/ \(.*/, ''))} · ${isCard ? 'ID card' : 'Passport'}</span>
+        ${sim ? '<span class="sample-tag">Specimen</span>' : '<span class="id-chip" aria-hidden="true"></span>'}
+      </div>
+      <div class="id-card-body">
         ${photo}
-        <div style="min-width:0">
-          <h3 class="name"><small>${esc(dg1.surname || '')}</small>${esc(dg1.givenNames || '')}</h3>
-          <dl class="facts">${facts.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v || '—')}</dd></div>`).join('')}</dl>
-          ${sigHtml}
+        <div>
+          <h2 class="id-name"><span class="id-surname">${esc(dg1.surname)}</span>${esc(dg1.givenNames)}</h2>
+          <dl class="id-facts">
+            <div><dt>Document no.</dt><dd>${esc(dg1.documentNumber)}</dd></div>
+            <div><dt>Sex</dt><dd>${esc(SEX[dg1.sex] || dg1.sex)}</dd></div>
+            <div><dt>Born</dt><dd>${esc(fmtDate(dg11.fullDateOfBirth || mrzDateToISO(dg1.dateOfBirth, 'birth')))}</dd></div>
+            <div><dt>Expires</dt><dd>${esc(fmtDate(mrzDateToISO(dg1.dateOfExpiry, 'expiry')))}</dd></div>
+          </dl>
         </div>
       </div>
-      <div class="mrz-block">${esc((dg1.lines || []).join('\n'))}</div>
+      <div class="mrz-strip">${esc((dg1.lines || []).join('\n'))}</div>
     </article>
-    <div class="verdicts">${verdicts.map(([c, t]) => `<span class="chip ${c}">${esc(t)}</span>`).join('')}</div>
-    <div class="sec-list">${sec.map(([k, v]) => `<div class="sec-row"><span>${esc(k)}</span><span>${v}</span></div>`).join('')}</div>`;
-  $('result-actions').hidden = false;
+    <div class="list-card">
+      ${checks.map(([tone, icon, title, sub]) => `<div class="row"><span class="icon-tile ${tone}" aria-hidden="true">${ICON[icon]}</span><span class="row-text"><strong>${esc(title)}</strong><span>${esc(sub)}</span></span></div>`).join('')}
+    </div>
+    <div class="list-card">
+      ${details.map(([k, v]) => `<div class="kv"><span>${esc(k)}</span><span>${esc(v || '—')}</span></div>`).join('')}
+    </div>
+    <details class="disclosure">
+      <summary>Technical details</summary>
+      <div class="list-card">${tech.map(([k, v]) => `<div class="kv"><span>${esc(k)}</span><span>${v}</span></div>`).join('')}</div>
+    </details>
+    <details class="disclosure">
+      <summary>APDU log (${state.logLines.length / 2 | 0} commands)</summary>
+      <pre class="log-body">${state.logLines.join('\n')}</pre>
+    </details>`;
 }
 
 function resultJSON() {
   const r = state.lastResult;
   if (!r) return '{}';
   const enc = (b) => btoa(Array.from(b, (x) => String.fromCharCode(x)).join(''));
-  return JSON.stringify(r, (k, v) => {
-    if (v instanceof Uint8Array) return { base64: enc(v) };
-    if (k === 'get' || typeof v === 'function') return undefined;
-    return v;
-  }, 2);
+  return JSON.stringify(r, (k, v) => (v instanceof Uint8Array ? { base64: enc(v) } : typeof v === 'function' ? undefined : v), 2);
 }
-
 function download() {
-  const blob = new Blob([resultJSON()], { type: 'application/json' });
   const a = document.createElement('a');
-  const dg1 = state.lastResult?.dataGroups?.DG1;
-  a.href = URL.createObjectURL(blob);
-  a.download = `chip-${dg1?.documentNumber || 'read'}.json`;
+  a.href = URL.createObjectURL(new Blob([resultJSON()], { type: 'application/json' }));
+  a.download = `chip-${state.lastResult?.dataGroups?.DG1?.documentNumber || 'read'}.json`;
   document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
-
 async function copyJSON() {
   const btn = $('btn-copy');
-  try { await navigator.clipboard.writeText(resultJSON()); btn.textContent = 'Copied'; }
-  catch { btn.textContent = 'Copy blocked'; }
+  try { await navigator.clipboard.writeText(resultJSON()); btn.textContent = 'Copied'; } catch { btn.textContent = 'Copy blocked'; }
   setTimeout(() => { btn.textContent = 'Copy JSON'; }, 1600);
-}
-
-function clearResult() {
-  state.lastResult = null;
-  $('result').innerHTML = '<div class="empty-state">No chip read yet. Fill in the MRZ details or CAN, then press Read.</div>';
-  $('result-actions').hidden = true;
-  setPhase(null);
-  for (const li of $('steps').children) li.className = '';
-  onStatus('Ready.');
 }
 
 // ---------------------------------------------------------------- NDEF probes
@@ -377,75 +430,63 @@ async function runProbe(kind) {
   try {
     const ctrl = new AbortController();
     setTimeout(() => ctrl.abort(), 30000);
-    const r = kind === 'webnfc' ? await probeWebNfc({ signal: ctrl.signal }) : await probeWebToNative();
-    out.textContent = JSON.stringify(r, null, 2);
-  } catch (e) {
-    out.textContent = e.name === 'AbortError' ? 'Timed out without a tag.' : `Error: ${e.message}`;
-  }
+    out.textContent = JSON.stringify(kind === 'webnfc' ? await probeWebNfc({ signal: ctrl.signal }) : await probeWebToNative(), null, 2);
+  } catch (e) { out.textContent = e.name === 'AbortError' ? 'Timed out without a tag.' : `Error: ${e.message}`; }
 }
 
-// ---------------------------------------------------------------- figures
-const PASSPORT_FIG = `
-<svg viewBox="0 0 140 96" role="img" aria-label="Passport data page with the two MRZ lines at the bottom">
-  <rect x="1" y="1" width="138" height="94" rx="5" fill="var(--surface)" stroke="var(--line)" stroke-width="1.5"/>
-  <rect x="8" y="12" width="26" height="33" rx="2" fill="var(--line)"/>
-  <rect x="40" y="13" width="52" height="4" rx="2" fill="var(--line)"/><rect x="40" y="22" width="70" height="4" rx="2" fill="var(--line)"/>
-  <rect x="40" y="31" width="40" height="4" rx="2" fill="var(--line)"/><rect x="40" y="40" width="58" height="4" rx="2" fill="var(--line)"/>
-  <rect x="5" y="64" width="130" height="25" rx="3" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
-  <text x="70" y="74" font-family="var(--font-mono)" font-size="6" fill="var(--accent)" text-anchor="middle">P&lt;KENSURNAME&lt;&lt;GIVEN&lt;NAMES&lt;&lt;&lt;</text>
-  <text x="70" y="84" font-family="var(--font-mono)" font-size="6" fill="var(--accent)" text-anchor="middle"><tspan font-weight="700">AK0012345</tspan>4KEN<tspan font-weight="700">900115</tspan>9F<tspan font-weight="700">320301</tspan>…</text>
+// ---------------------------------------------------------------- where-to-find tips
+const PASSPORT_TIP = `
+<svg class="doc-mini" viewBox="0 0 92 62" aria-hidden="true">
+  <rect x="1" y="1" width="90" height="60" rx="6" fill="var(--surface-2)" stroke="var(--line)" stroke-width="1.5"/>
+  <rect x="6" y="7" width="17" height="21" rx="2" fill="var(--line)"/>
+  <rect x="28" y="8" width="40" height="4" rx="2" fill="var(--line)"/><rect x="28" y="16" width="52" height="4" rx="2" fill="var(--line)"/>
+  <rect x="4" y="40" width="84" height="17" rx="3" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.2"/>
+  <path d="M8 46h76M8 51.5h76" stroke="var(--accent)" stroke-width="2" stroke-dasharray="2.5 1.5"/>
 </svg>
-<figcaption><strong>Passport:</strong> copy the document number, date of birth and expiry date from the two MRZ lines at the bottom of the photo page (bold parts).</figcaption>`;
-
-const IDCARD_FIG = `
-<svg viewBox="0 0 140 90" role="img" aria-label="ID card back with three MRZ lines">
-  <rect x="1" y="1" width="138" height="88" rx="7" fill="var(--surface)" stroke="var(--line)" stroke-width="1.5"/>
-  <rect x="10" y="10" width="20" height="16" rx="2.5" fill="none" stroke="var(--muted)" stroke-width="1.2"/>
-  <path d="M10 18h20M20 10v16" stroke="var(--muted)" stroke-width="0.8"/>
-  <rect x="40" y="12" width="60" height="4" rx="2" fill="var(--line)"/><rect x="40" y="21" width="44" height="4" rx="2" fill="var(--line)"/>
-  <rect x="5" y="44" width="130" height="40" rx="3" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
-  <text x="70" y="55" font-family="var(--font-mono)" font-size="6.4" fill="var(--accent)" text-anchor="middle">IDKEN<tspan font-weight="700">MC0001234</tspan>0&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;</text>
-  <text x="70" y="66" font-family="var(--font-mono)" font-size="6.4" fill="var(--accent)" text-anchor="middle"><tspan font-weight="700">850704</tspan>8M<tspan font-weight="700">340704</tspan>1KEN&lt;&lt;&lt;&lt;&lt;</text>
-  <text x="70" y="77" font-family="var(--font-mono)" font-size="6.4" fill="var(--accent)" text-anchor="middle">SURNAME&lt;&lt;GIVEN&lt;NAMES&lt;&lt;&lt;</text>
+<p><strong>Passport:</strong> the MRZ is the two lines at the bottom of the photo page. Line 2 starts with the document number, then the birth date and expiry date.</p>`;
+const IDCARD_TIP = `
+<svg class="doc-mini" viewBox="0 0 92 62" aria-hidden="true">
+  <rect x="1" y="1" width="90" height="60" rx="7" fill="var(--surface-2)" stroke="var(--line)" stroke-width="1.5"/>
+  <rect x="7" y="7" width="13" height="10" rx="2" fill="none" stroke="var(--muted)" stroke-width="1.2"/>
+  <rect x="4" y="27" width="84" height="30" rx="3" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.2"/>
+  <path d="M8 34h76M8 42h76M8 50h76" stroke="var(--accent)" stroke-width="2" stroke-dasharray="2.5 1.5"/>
 </svg>
-<figcaption><strong>ID card:</strong> the MRZ is the three lines on the back. Line 1 holds the document number, line 2 the birth and expiry dates. If the front shows a 6-digit CAN, you can use that instead.</figcaption>`;
+<p><strong>ID card:</strong> the MRZ is the three lines on the back. Line 1 holds the document number, line 2 the birth and expiry dates. A 6-digit CAN on the front works too.</p>`;
 
 // ---------------------------------------------------------------- boot
 async function boot() {
   document.querySelectorAll('[data-source]').forEach((b) => b.addEventListener('click', () => setSource(b.dataset.source)));
   document.querySelectorAll('[data-doc]').forEach((b) => b.addEventListener('click', () => setDoc(b.dataset.doc)));
   document.querySelectorAll('[data-access]').forEach((b) => b.addEventListener('click', () => setAccess(b.dataset.access)));
-  for (const id of ['in-doc', 'in-dob', 'in-doe']) $(id).addEventListener('input', renderKey);
+  document.querySelectorAll('[data-go]').forEach((b) => b.addEventListener('click', () => go(b.dataset.go)));
+  document.querySelectorAll('[data-back]').forEach((b) => b.addEventListener('click', back));
+  $('btn-back').addEventListener('click', back);
+  $('btn-about').addEventListener('click', () => go('about'));
+  for (const id of ['in-doc', 'in-dob', 'in-doe']) $(id).addEventListener('input', () => { renderKey(); $('key-error').hidden = true; });
+  $('in-can').addEventListener('input', () => { $('key-error').hidden = true; });
   $('in-mrz').addEventListener('input', onMrzPaste);
-  for (const f of ['pane-mrz', 'pane-can']) $(f).addEventListener('submit', (e) => { e.preventDefault(); scan(); });
-  $('btn-scan').addEventListener('click', () => scan());
+  const next = () => { if (validateKey()) go('prep'); };
+  $('btn-key-next').addEventListener('click', next);
+  for (const f of ['pane-mrz', 'pane-can']) $(f).addEventListener('submit', (e) => { e.preventDefault(); next(); });
+  $('btn-scan').addEventListener('click', scan);
+  $('btn-retry').addEventListener('click', () => { state.stack.pop(); scan(); });
+  $('btn-cancel').addEventListener('click', back);
   $('btn-copy').addEventListener('click', copyJSON);
   $('btn-download').addEventListener('click', download);
-  $('btn-clear').addEventListener('click', clearResult);
+  $('btn-clear').addEventListener('click', () => { state.lastResult = null; reset('doc'); });
   $('btn-webnfc').addEventListener('click', () => runProbe('webnfc'));
   $('btn-wtn').addEventListener('click', () => runProbe('wtn'));
   $('in-csca').addEventListener('change', (e) => importCsca(e.target.files));
-  $('opt-log').addEventListener('change', () => { $('log-wrap').hidden = !$('opt-log').checked && !state.logLines.length; $('log-wrap').open = $('opt-log').checked; $('log').innerHTML = state.logLines.join('\n'); });
-  $('env').innerHTML = '<span class="chip">Checking…</span>';
 
   await detectEnvironment();
-  setDoc(state.doc);
   setAccess('MRZ');
   renderCscaCount();
-  if (state.nativeStatus === 'ready' || state.nativeStatus === 'disabled') {
-    setSource('native');
-    $('in-doc').value = ''; $('in-dob').value = ''; $('in-doe').value = ''; $('in-can').value = '';
-    renderKey();
-    clearResult();
-  } else {
-    // No chip access here: open with a finished sample read so the page shows what it does.
-    $('src-native').title = 'Needs the Android app shell';
-    setSource('sim');
-    await scan({ sample: true });
-  }
+  setSource(state.nativeStatus === 'ready' || state.nativeStatus === 'disabled' ? 'native' : 'sim');
+  setDoc(state.doc);
+  reset('doc');
 
   if ('serviceWorker' in navigator && location.protocol === 'https:' && !AndroidBridgeTransport.present()) {
-    navigator.serviceWorker.register('sw.js').catch(() => { /* not available in this context */ });
+    navigator.serviceWorker.register('sw.js').catch(() => { /* not available here */ });
   }
 }
 
